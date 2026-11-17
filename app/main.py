@@ -5,6 +5,8 @@ Endpoints
 POST /predict                 submit an image + deadline_ms (from acceptance)
 GET  /orders/{order_id}       query status / result by order id
 POST /orders/{order_id}/cancel  cancel a queued or in-flight order
+POST /orders/{order_id}/explanation  request a 4x4 occlusion explanation (completed orders only)
+GET  /orders/{order_id}/explanation  poll explanation status / heatmap
 GET  /stats                   capacity and state counters (demo/observability)
 GET  /health                  liveness
 Interactive docs are served at /docs (Swagger UI).
@@ -17,8 +19,15 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 
 from .config import Settings
-from .engine import COMPLETED, BatchEngine, Order
-from .preprocessing import preprocess
+from .engine import (
+    COMPLETED,
+    FAILED,
+    GRID,
+    BatchEngine,
+    OcclusionJob,
+    Order,
+)
+from .preprocessing import IMAGE_SIZE, preprocess
 
 
 def order_view(o: Order) -> dict:
@@ -31,6 +40,23 @@ def order_view(o: Order) -> dict:
         "batch_id": o.batch_id,
         "result": o.result if o.state == COMPLETED else None,
     }
+
+
+def explanation_view(job: OcclusionJob) -> dict:
+    """Status view. `heatmap` is present only when every cell succeeded."""
+    view = {
+        "order_id": job.order_id,
+        "status": job.state,
+        "predicted_class": job.predicted_class,
+        "original_prob": job.original_prob,
+        "grid": [GRID, GRID],
+        "cell_pixels": IMAGE_SIZE // GRID,
+        "occlusion_value": 0.0,
+        "progress": {"cells_done": job.cells_done, "cells_total": GRID * GRID},
+        "heatmap": job.heatmap if job.state == COMPLETED else None,
+        "error": job.error if job.state == FAILED else None,
+    }
+    return view
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -96,6 +122,43 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if order.state == COMPLETED:
             raise HTTPException(409, "order already completed; cannot cancel")
         return order_view(order)
+
+    @app.post("/orders/{order_id}/explanation", status_code=202)
+    async def request_explanation(order_id: str):
+        """Queue a 4x4 occlusion heatmap for a COMPLETED order.
+
+        Idempotent: a repeated request returns the existing job (202) instead
+        of queueing duplicate work. The order and its original result are
+        never modified.
+        """
+        outcome, job = engine.request_explanation(order_id)
+        if outcome == "not_found":
+            raise HTTPException(404, "unknown order_id")
+        if outcome == "not_completed":
+            raise HTTPException(
+                409, "only completed orders can be explained"
+            )
+        if outcome == "full":
+            raise HTTPException(
+                429,
+                f"explanation queue full: at most {engine.max_capacity} pending explanations",
+            )
+        return explanation_view(job)
+
+    @app.get("/orders/{order_id}/explanation")
+    async def get_explanation(order_id: str):
+        """Poll an explanation. No partial heatmap is ever returned."""
+        order = engine.get(order_id)
+        if order is None:
+            raise HTTPException(404, "unknown order_id")
+        job = engine.get_explanation(order_id)
+        if job is None:
+            if order.state != COMPLETED:
+                raise HTTPException(
+                    409, "only completed orders can be explained"
+                )
+            raise HTTPException(404, "no explanation requested for this order")
+        return explanation_view(job)
 
     @app.get("/stats")
     async def stats():
